@@ -134,5 +134,21 @@ export const DC_DEFAULT_API_DEFINITIONS: Partial<JiraApiConfig> = {
         dataField: '.',
       },
     },
+    NotificationScheme: {
+      deployRequests: {
+        add: {
+          url: '/rest/api/3/notificationscheme',
+          method: 'post',
+        },
+        modify: {
+          url: '/rest/api/3/notificationscheme/{id}',
+          method: 'put',
+        },
+        remove: {
+          url: '/rest/api/3/notificationscheme/{id}',
+          method: 'delete',
+        },
+      },
+    },
   },
 }
