@@ -861,7 +861,21 @@ const DEFAULT_TYPE_CUSTOMIZATIONS: JiraApiConfig['types'] = {
       fieldsToHide: [{ fieldName: 'id' }],
       serviceUrl: '/secure/admin/EditNotifications!default.jspa?schemeId={id}',
     },
-  },
+    deployRequests: {
+      add: {
+        url: '/rest/api/3/notificationscheme',
+        method: 'post',
+      },
+      modify: {
+        url: '/rest/api/3/notificationscheme/{id}',
+        method: 'put',
+      },
+      remove: {
+        url: '/rest/api/3/notificationscheme/{notificationSchemeId}',
+        method: 'delete',
+      },
+    },
+  }, // check if needed
   NotificationSchemeEvent: {
     transformation: {
       fieldTypeOverrides: [

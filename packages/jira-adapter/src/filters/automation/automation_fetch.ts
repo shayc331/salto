@@ -41,7 +41,7 @@ const PAGE_RESPONSE_SCHEME = Joi.object({
   values: Joi.array().items(Joi.object()).required(),
 }).unknown(true).required()
 
-const isPageResponse = createSchemeGuard<PageResponse>(PAGE_RESPONSE_SCHEME, 'Received an invalid page response')
+export const isPageResponse = createSchemeGuard<PageResponse>(PAGE_RESPONSE_SCHEME, 'Received an invalid page response')
 
 const requestPage = async (
   url: string,

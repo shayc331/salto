@@ -19,12 +19,13 @@ import _ from 'lodash'
 import { logger } from '@salto-io/logging'
 import { resolveChangeElement, safeJsonStringify } from '@salto-io/adapter-utils'
 import Joi from 'joi'
-import { getFilledJspUrls } from '../../utils'
+// import { getFilledJspUrls } from '../../utils'
 import JiraClient from '../../client/client'
-import { JiraConfig } from '../../config/config'
-import { deployWithJspEndpoints } from '../../deployment/jsp_deployment'
-import { NOTIFICATION_EVENT_TYPE_NAME } from '../../constants'
+// import { JiraConfig } from '../../config/config'
+// import { deployWithJspEndpoints } from '../../deployment/jsp_deployment'
+// import { NOTIFICATION_EVENT_TYPE_NAME } from '../../constants'
 import { getLookUpName } from '../../reference_mapping'
+import { isPageResponse } from '../automation/automation_fetch'
 
 const log = logger(module)
 
@@ -35,19 +36,20 @@ type EventValues = {
   id?: string
 }
 
-const EVENT_TYPES: Record<string, string> = {
-  ProjectLead: 'Project_Lead',
-  CurrentAssignee: 'Current_Assignee',
-  Reporter: 'Current_Reporter',
-  CurrentUser: 'Remote_User',
-  ComponentLead: 'Component_Lead',
-  User: 'Single_User',
-  Group: 'Group_Dropdown',
-  ProjectRole: 'Project_Role',
-  EmailAddress: 'Single_Email_Address',
-  AllWatchers: 'All_Watchers',
-  UserCustomField: 'User_Custom_Field_Value',
-  GroupCustomField: 'Group_Custom_Field_Value',
+export const EVENT_TYPES: Record<string, string> = { // need to refactor the event types names !!!
+  // User: 'SingleUser', // not working - User is not supported
+  // Group: 'GroupDropdown', // not working - Group is not supported
+  // ProjectRole: 'Project_Role' // not working - ProjectRole is not supported
+  // UserCustomField: 'User_Custom_Field' // not working - UserCustomField is not supported,
+  GroupCustomFieldll: 'Group_Custom_Field_Value', // not working - GroupCustomField is not supported,
+}
+
+type Notifications = {
+  notificationType: string
+  parameter?: unknown // maybe add display name
+  user?: unknown
+  additionalProperties?: unknown
+  id?: number
 }
 
 type NotificationEvent = {
@@ -55,15 +57,11 @@ type NotificationEvent = {
     id: number
   }
   eventType?: number
-  notifications?: {
-    notificationType: string
-    user?: unknown
-    additionalProperties?: unknown
-  }[]
+  notifications: Notifications[]
 }
 
 type NotificationScheme = {
-  notificationSchemeEvents?: NotificationEvent[]
+  notificationSchemeEvents: NotificationEvent[]
 }
 
 const NOTIFICATION_SCHEME = Joi.object({
@@ -81,7 +79,7 @@ const NOTIFICATION_SCHEME = Joi.object({
   ).optional(),
 }).unknown(true).required()
 
-const isNotificationScheme = (value: unknown): value is NotificationScheme => {
+export const isNotificationScheme = (value: unknown): value is NotificationScheme => {
   const { error } = NOTIFICATION_SCHEME.validate(value)
   if (error !== undefined) {
     log.error(`Received an invalid notification scheme: ${error.message}, ${safeJsonStringify(value)}`)
@@ -109,10 +107,27 @@ export const transformAllNotificationEvents = (notificationSchemeValues: Values)
     ?.forEach(transformNotificationEvent)
 }
 
+// const data = {
+//   notificationSchemeEvents: [{
+//     event: {
+//       id: eventInstance.value.eventTypeIds,
+//     },
+//     notifications: [
+//       {
+//         notificationType: eventInstance.value.type,
+//         parameter: eventInstance.value.parameter,
+//       },
+//     ],
+//   }],
+// }
+
 const convertValuesToJSPBody = (values: Values, instance: InstanceElement): Values => {
   const type = EVENT_TYPES[values.type] ?? values.type
-
   return _.pickBy({
+    event: { id: values.eventType },
+    notifications: instance.value.notificationSchemeEvents
+      .filter((event: NotificationEvent) => event.eventType === values.eventType)
+      .flatMap((event: NotificationEvent) => event.notifications),
     id: values.id,
     schemeId: instance.value.id,
     name: values.name,
@@ -170,7 +185,7 @@ const getEventChanges = async (
   const eventType = await getEventType(change)
   const eventInstancesBefore = _.keyBy(
     isModificationChange(change)
-      ? getEventInstances(change.data.before, eventType)
+      ? getEventInstances(change.data.before, eventType) // try to add new event
       : [],
     instance => instance.elemID.getFullName(),
   )
@@ -195,35 +210,20 @@ const getEventChanges = async (
 export const deployEvents = async (
   change: AdditionChange<InstanceElement> | ModificationChange<InstanceElement>,
   client: JiraClient,
-  config: JiraConfig,
 ): Promise<void> => {
   const eventChanges = await getEventChanges(await resolveChangeElement(change, getLookUpName))
   const instance = getChangeData(change)
 
-  const urls = getFilledJspUrls(instance, config, NOTIFICATION_EVENT_TYPE_NAME)
-
-  const res = await deployWithJspEndpoints({
-    changes: eventChanges,
-    client,
-    urls,
-    queryFunction: async () => {
-      if (urls.query === undefined) {
-        throw new Error(`${NOTIFICATION_EVENT_TYPE_NAME} is missing a JSP query url`)
-      }
-      const response = await client.getSinglePage({ url: urls.query })
-      if (Array.isArray(response.data)) {
-        throw new Error(`Received unexpected response from ${NOTIFICATION_EVENT_TYPE_NAME}`)
-      }
-      transformAllNotificationEvents(response.data)
-      return getEventsValues(response.data)
-        .map(event => ({ ...event, name: getEventKey(event) }))
-        .map(eventValues => convertValuesToJSPBody(eventValues, instance))
-    },
-  })
-
-  eventChanges.forEach(eventChange => {
+  await Promise.all(eventChanges.map(async eventChange => {
     const eventInstance = getChangeData(eventChange)
+    const notificationSchemeId = eventInstance.value.schemeId
     if (isRemovalChange(eventChange)) {
+      const notificationId = instance.value.notificationIds[eventInstance.value.name]
+      await client.delete(
+        {
+          url: `/rest/api/3/notificationscheme/${notificationSchemeId}/notification/${notificationId}`,
+        }
+      )
       delete instance.value.notificationIds[eventInstance.value.name]
     }
 
@@ -231,12 +231,48 @@ export const deployEvents = async (
       if (instance.value.notificationIds === undefined) {
         instance.value.notificationIds = {}
       }
-      instance.value.notificationIds[eventInstance.value.name] = eventInstance.value.id
+      // eslint-disable-next-line no-console
+      console.log('here')
+      const data = {
+        notificationSchemeEvents: [{
+          event: {
+            id: eventInstance.value.eventTypeIds,
+          },
+          notifications: eventInstance.value.notifications.map((notification: Notifications) => _.pickBy({
+            notificationType: EVENT_TYPES[notification.notificationType] ?? notification.notificationType,
+            parameter: notification.parameter,
+          }, lowerdashValues.isDefined)),
+        }],
+      }
+      await client.put(
+        {
+          url: `/rest/api/3/notificationscheme/${notificationSchemeId}/notification`,
+          data,
+        }
+      ) // what should I do if this fail
+      const response = await client.getSinglePage(
+        {
+          url: '/rest/api/3/notificationscheme',
+          queryParams: {
+            id: notificationSchemeId,
+            expand: 'notificationSchemeEvents',
+          },
+        }
+      )
+      if (isPageResponse(response.data) && isNotificationScheme(response.data.values[0])) {
+        const notificationEvent = response.data.values[0].notificationSchemeEvents
+          .filter((event: NotificationEvent) => event.event?.id === eventInstance.value.eventTypeIds)
+          .flatMap((event: NotificationEvent) => event.notifications)
+          .filter((notification: Notifications) =>
+            notification.notificationType === eventInstance.value.type)
+        instance.value.notificationIds[eventInstance.value.name] = notificationEvent[0].id
+      }
     }
-  })
+  }))
 
-  if (res.errors.length !== 0) {
-    log.error(`Failed to deploy notification scheme events of ${instance.elemID.getFullName()}: ${res.errors.join(', ')}`)
-    throw new Error(`Failed to deploy notification scheme events of ${instance.elemID.getFullName()}`)
-  }
+  // if (res.errors.length !== 0) {
+  //   log.error(`Failed to deploy notification scheme events of
+  // ${instance.elemID.getFullName()}: ${res.errors.join(', ')}`)
+  //   throw new Error(`Failed to deploy notification scheme events of ${instance.elemID.getFullName()}`)
+  // }
 }

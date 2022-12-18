@@ -13,24 +13,46 @@
 * See the License for the specific language governing permissions and
 * limitations under the License.
 */
-import { Element, getChangeData, isAdditionOrModificationChange, isInstanceChange, isRemovalChange, isRemovalOrModificationChange } from '@salto-io/adapter-api'
-import { client as clientUtils } from '@salto-io/adapter-components'
+import { Change, Element, getChangeData, InstanceElement, isAdditionOrRemovalChange, isInstanceChange, isModificationChange, isRemovalOrModificationChange, ReferenceExpression } from '@salto-io/adapter-api'
 import { logger } from '@salto-io/logging'
 import _ from 'lodash'
-import { collections } from '@salto-io/lowerdash'
+import Joi from 'joi'
+import { safeJsonStringify } from '@salto-io/adapter-utils'
 import { findObject, setFieldDeploymentAnnotations, setTypeDeploymentAnnotations } from '../../utils'
 import { FilterCreator } from '../../filter'
-import { deployWithJspEndpoints } from '../../deployment/jsp_deployment'
 import { NOTIFICATION_EVENT_TYPE_NAME, NOTIFICATION_SCHEME_TYPE_NAME } from '../../constants'
-import { deployChanges } from '../../deployment/standard_deployment'
+import { defaultDeployChange, deployChanges } from '../../deployment/standard_deployment'
 import { deployEvents } from './notification_events'
-
-const { awu } = collections.asynciterable
 
 const log = logger(module)
 
+type NotificationEvent = {
+  event?: unknown
+  eventType?: ReferenceExpression
+  notifications?: {
+    type?: string
+    notificationType?: string
+    user?: unknown
+    additionalProperties?: unknown
+  }[]
+}
 
-const filter: FilterCreator = ({ client, config, paginator }) => ({
+const NOTIFICATION_SCHEME_EVENT = Joi.object({
+  eventType: Joi.any(),
+}).unknown(true)
+
+
+const isNotificationSchemeEvent = (value: unknown): value is NotificationEvent => {
+  const { error } = NOTIFICATION_SCHEME_EVENT.validate(value)
+  if (error !== undefined) {
+    log.error(`Received an invalid notification scheme event: ${error.message}, ${safeJsonStringify(value)}`)
+    return false
+  }
+  return true
+}
+
+
+const filter: FilterCreator = ({ client, config }) => ({
   onFetch: async (elements: Element[]) => {
     if (!config.client.usePrivateAPI) {
       log.debug('Skipping notification scheme deployment filter because private API is not enabled')
@@ -50,6 +72,8 @@ const filter: FilterCreator = ({ client, config, paginator }) => ({
     if (notificationEventType !== undefined) {
       setFieldDeploymentAnnotations(notificationEventType, 'eventType')
       setFieldDeploymentAnnotations(notificationEventType, 'notifications')
+      delete notificationEventType.fields.event
+      delete notificationEventType.fields.notifications
     }
   },
 
@@ -69,42 +93,28 @@ const filter: FilterCreator = ({ client, config, paginator }) => ({
         && getChangeData(change).elemID.typeName === NOTIFICATION_SCHEME_TYPE_NAME
     )
 
-    const jspRequests = config.apiDefinitions.types[NOTIFICATION_SCHEME_TYPE_NAME]?.jspRequests
-    if (jspRequests === undefined) {
-      throw new Error(`${NOTIFICATION_SCHEME_TYPE_NAME} jsp urls are missing from the configuration`)
-    }
-
-    const requestConfig = config.apiDefinitions.types.NotificationSchemes.request
-    if (requestConfig === undefined) {
-      throw new Error(`${NOTIFICATION_SCHEME_TYPE_NAME} is missing request config`)
-    }
-
-    const deployResult = await deployWithJspEndpoints({
-      changes: relevantChanges.filter(isInstanceChange),
-      client,
-      urls: jspRequests,
-      queryFunction: async () => awu(paginator(
-        requestConfig,
-        page => collections.array.makeArray(page.values) as clientUtils.ResponseValue[]
-      )).flat().toArray(),
-      serviceValuesTransformer: serviceValues => ({
-        ...serviceValues,
-        schemeId: serviceValues.id,
-      }),
-      fieldsToIgnore: [
-        'notificationSchemeEvents',
-      ],
-    })
+    const deployResult = await deployChanges(
+      relevantChanges as Change<InstanceElement>[],
+      async change => {
+        await defaultDeployChange({
+          change,
+          client,
+          apiDefinitions: config.apiDefinitions,
+          fieldsToIgnore: isAdditionOrRemovalChange(change)
+            ? []
+            : [NOTIFICATION_EVENT_TYPE_NAME],
+        })
+      }
+    )
 
     const eventsDeployResult = await deployChanges(
       deployResult.appliedChanges
-        .filter(isAdditionOrModificationChange)
+        .filter(isModificationChange)
         .filter(isInstanceChange),
 
       change => deployEvents(
         change,
         client,
-        config,
       )
     )
 
@@ -112,7 +122,7 @@ const filter: FilterCreator = ({ client, config, paginator }) => ({
       leftoverChanges,
       deployResult: {
         appliedChanges: [
-          ...deployResult.appliedChanges.filter(isRemovalChange),
+          ...deployResult.appliedChanges,
           ...eventsDeployResult.appliedChanges,
         ],
         errors: [
@@ -129,11 +139,26 @@ const filter: FilterCreator = ({ client, config, paginator }) => ({
     }
     changes
       .filter(isInstanceChange)
-      .filter(isRemovalOrModificationChange)
-      .map(getChangeData)
-      .filter(instance => instance.elemID.typeName === NOTIFICATION_SCHEME_TYPE_NAME)
-      .forEach(instance => {
-        instance.value.schemeId = instance.value.id
+      .filter(change => getChangeData(change).elemID.typeName === NOTIFICATION_SCHEME_TYPE_NAME)
+      .forEach(change => {
+        const instance = getChangeData(change)
+        const { notificationSchemeEvents } = instance.value
+        if (notificationSchemeEvents !== undefined) {
+          notificationSchemeEvents.filter(isNotificationSchemeEvent)
+            .forEach(async (event: NotificationEvent) => {
+              if (event.eventType !== undefined) {
+                event.event = event.eventType
+                event.notifications?.forEach(notification => {
+                  if (notification.type !== undefined) {
+                    notification.notificationType = notification.type
+                  }
+                })
+              }
+            })
+        }
+        if (isRemovalOrModificationChange(change)) {
+          instance.value.schemeId = instance.value.id
+        }
       })
   },
 
@@ -143,11 +168,23 @@ const filter: FilterCreator = ({ client, config, paginator }) => ({
     }
     changes
       .filter(isInstanceChange)
-      .filter(isRemovalOrModificationChange)
-      .map(getChangeData)
-      .filter(instance => instance.elemID.typeName === NOTIFICATION_SCHEME_TYPE_NAME)
-      .forEach(instance => {
-        delete instance.value.schemeId
+      .filter(change => getChangeData(change).elemID.typeName === NOTIFICATION_SCHEME_TYPE_NAME)
+      .forEach(change => {
+        const instance = getChangeData(change)
+        instance.value.id = Number(instance.value.id)
+        const { notificationSchemeEvents } = instance.value
+        if (notificationSchemeEvents !== undefined) {
+          notificationSchemeEvents.filter(isNotificationSchemeEvent)
+            .forEach(async (event: NotificationEvent) => {
+              event.notifications?.forEach(notification => {
+                delete notification.notificationType
+              })
+              delete event.event
+            })
+        }
+        if (isRemovalOrModificationChange(change)) {
+          delete instance.value.schemeId
+        }
       })
   },
 })
