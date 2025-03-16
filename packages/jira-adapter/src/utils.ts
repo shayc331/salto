@@ -271,3 +271,10 @@ export const getHTMLStaticFileName = (path: ElemID): string | undefined => {
 }
 
 export const isHTMLResponse = createSchemeGuard<HTMLResponse>(HTML_RESPONSE_SCHEME, 'Failed to get HTML response')
+
+export const addOrUpdate = <T>(dataSet: Record<string, T[]>, key: string, value: T): void => {
+  if (dataSet[key] === undefined) {
+    dataSet[key] = []
+  }
+  dataSet[key].push(value)
+}

@@ -6,18 +6,11 @@
  * CERTAIN THIRD PARTY SOFTWARE MAY BE CONTAINED IN PORTIONS OF THE SOFTWARE. See NOTICE FILE AT https://github.com/salto-io/salto/blob/main/NOTICES
  */
 import {
-  BuiltinTypes,
   CORE_ANNOTATIONS,
   Element,
-  Field,
-  InstanceElement,
-  isInstanceElement,
   isObjectType,
-  ListType,
   ObjectType,
 } from '@salto-io/adapter-api'
-import _ from 'lodash'
-import { collections } from '@salto-io/lowerdash'
 import { ImportantValues } from '@salto-io/adapter-utils'
 import { FilterCreator } from '../filter'
 import {
@@ -37,8 +30,7 @@ import {
 } from '../constants'
 import { FIELD_TYPE_NAME } from './fields/constants'
 import { PROJECT_SCOPE_FIELD_NAME } from './projects_scope'
-
-const { makeArray } = collections.array
+import { addOrUpdate } from '../utils'
 
 const importantValuesMap: Record<string, ImportantValues> = {
   [APPLICATION_PROPERTY_TYPE]: [{ value: 'type', highlighted: false, indexed: true }],
@@ -110,39 +102,24 @@ const importantValuesMap: Record<string, ImportantValues> = {
   [WEBHOOK_TYPE]: [{ value: 'Enabled', highlighted: false, indexed: true }],
 }
 
-const createProjectScopeField = (objectType: ObjectType): Field =>
-  new Field(objectType, PROJECT_SCOPE_FIELD_NAME, new ListType(BuiltinTypes.STRING), {
-    [CORE_ANNOTATIONS.HIDDEN_VALUE]: true,
-  })
-
-const addProjectScopeAnnotation = (objectType: ObjectType): void => {
-  objectType.annotations[CORE_ANNOTATIONS.IMPORTANT_VALUES] = [
-    ...makeArray(objectType.annotations[CORE_ANNOTATIONS.IMPORTANT_VALUES]),
-    {
-      value: PROJECT_SCOPE_FIELD_NAME,
-      highlighted: false,
-      indexed: true,
-    },
-  ]
+const addProjectsScopeToImportantValuesMap = (objectTypes: ObjectType[]): void => {
+  objectTypes.filter(objectType => objectType.fields[PROJECT_SCOPE_FIELD_NAME] !== undefined)
+    .forEach(objectType => {
+      const { typeName } = objectType.elemID
+      addOrUpdate(importantValuesMap, typeName, {
+        value: PROJECT_SCOPE_FIELD_NAME,
+        highlighted: false,
+        indexed: true,
+      })
+    })
 }
-
-const addProjectScopeToObjectTypes = (instances: InstanceElement[]): void => {
-  const objectTypes = _.uniqBy(
-    instances.map(instance => instance.getTypeSync()),
-    objectType => objectType.elemID.getFullName(),
-  )
-
-  objectTypes.forEach(objectType => {
-    objectType.fields[PROJECT_SCOPE_FIELD_NAME] = createProjectScopeField(objectType)
-    addProjectScopeAnnotation(objectType)
-  })
-}
-
 // Adds relevant important values for the Jira adapter
 const filter: FilterCreator = () => ({
   name: 'addImportantValues',
   onFetch: async (elements: Element[]): Promise<void> => {
     const objectTypes = elements.filter(isObjectType)
+    addProjectsScopeToImportantValuesMap(objectTypes)
+
     objectTypes.forEach(obj => {
       const { typeName } = obj.elemID
       const importantValuesArray = importantValuesMap[typeName]
@@ -150,8 +127,6 @@ const filter: FilterCreator = () => ({
         obj.annotations[CORE_ANNOTATIONS.IMPORTANT_VALUES] = importantValuesArray
       }
     })
-    // projectsScope field
-    addProjectScopeToObjectTypes(elements.filter(isInstanceElement))
   },
 })
 

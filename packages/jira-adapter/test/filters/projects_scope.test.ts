@@ -5,7 +5,7 @@
  *
  * CERTAIN THIRD PARTY SOFTWARE MAY BE CONTAINED IN PORTIONS OF THE SOFTWARE. See NOTICE FILE AT https://github.com/salto-io/salto/blob/main/NOTICES
  */
-import { CORE_ANNOTATIONS, InstanceElement, ObjectType, ReferenceExpression } from '@salto-io/adapter-api'
+import { BuiltinTypes, CORE_ANNOTATIONS, ElemID, InstanceElement, ObjectType, ReferenceExpression } from '@salto-io/adapter-api'
 import { filterUtils } from '@salto-io/adapter-components'
 
 import _ from 'lodash'
@@ -73,6 +73,44 @@ describe('projectsScopeFilter', () => {
     })
   })
 
+  describe('object types', () => {
+    let objectType1: ObjectType
+    let objectType2: ObjectType
+    let instance1: InstanceElement
+    let instance2: InstanceElement
+
+    beforeEach(async () => {
+      objectType1 = createEmptyType('objectType1')
+      objectType2 = new ObjectType({
+        elemID: new ElemID('objectType2'),
+        fields: {
+         anotherField: { refType: BuiltinTypes.STRING } 
+        },
+      })
+      instance1 = new InstanceElement('instance1', objectType1)
+      instance2 = new InstanceElement('instance2', objectType2)
+    })
+
+    it('should add projectsScope as a hidden field to object types', async () => {
+      const objectTypes = [objectType1, objectType2]
+      await filter.onFetch([instance1, instance2, ...objectTypes])
+
+      objectTypes.forEach(objectType => {
+        expect(objectType.fields.projectsScope).toBeDefined()
+        expect(objectType.fields.projectsScope.annotations[CORE_ANNOTATIONS.HIDDEN_VALUE]).toBeTrue()
+      })
+    })
+
+    it('should not add projectsScope field to object types that does not represent instances', async () => {
+      const objectTypes = [objectType1, objectType2]
+      await filter.onFetch(objectTypes)
+      objectTypes.forEach(objectType => {
+        expect(objectType.fields.projectsScope).toBeUndefined()
+      })
+    })
+
+  })
+
   describe('references from projects', () => {
     let project1Ref11: InstanceElement
     let project1Ref12: InstanceElement
@@ -80,6 +118,7 @@ describe('projectsScopeFilter', () => {
     let project1Ref21: InstanceElement
     let project1Ref22: InstanceElement
     let project1Ref31: InstanceElement
+    let project1Ref14: InstanceElement
 
     let project2Ref11: InstanceElement
     let project2Ref12: InstanceElement
@@ -103,6 +142,10 @@ describe('projectsScopeFilter', () => {
         field: new ReferenceExpression(project1Ref22.elemID, project1Ref22),
       })
       project1Ref13 = new InstanceElement('project1Ref13', generalType)
+
+      project1Ref14 = new InstanceElement('project1Ref14', generalType, {
+        name: 'project1Ref14',
+      })
       // Project1 => project1Ref13
       project1 = new InstanceElement('project1', projectType, {
         key: 'project1Key',
@@ -110,6 +153,8 @@ describe('projectsScopeFilter', () => {
         field2: new ReferenceExpression(project1Ref12.elemID, project1Ref12),
         field3: new ReferenceExpression(project1Ref13.elemID, project1Ref13),
         field4: new ReferenceExpression(bothProjectsRef.elemID, bothProjectsRef),
+        // reference to not a top level element
+        field5: new ReferenceExpression(project1Ref14.elemID.createNestedID('name'), project1Ref14.value.name),
       })
 
       // project2Ref11 => project2Ref21
@@ -146,6 +191,7 @@ describe('projectsScopeFilter', () => {
         project1Ref21,
         project1Ref22,
         project1Ref31,
+        project1Ref14,
         project2,
         // project2 references
         project2Ref11,
@@ -156,16 +202,16 @@ describe('projectsScopeFilter', () => {
         bothProjectsRef,
       ]
       await filter.onFetch(elements)
-      expect(elements.length).toBe(13)
-      const project1RefInstances = elements.slice(0, 7)
+      expect(elements.length).toBe(14)
+      const project1RefInstances = elements.slice(0, 8)
       project1RefInstances.forEach(instance => {
         expect(instance.value.projectsScope).toEqual(['project1Key'])
       })
-      const project2RefInstances = elements.slice(7, 12)
+      const project2RefInstances = elements.slice(8, 12)
       project2RefInstances.forEach(instance => {
         expect(instance.value.projectsScope).toEqual(['project2Key'])
       })
-      expect(elements[12].value.projectsScope).toEqual(['project1Key', 'project2Key'])
+      expect(elements[13].value.projectsScope).toEqual(['project1Key', 'project2Key'])
     })
 
     it('should not add projectsScope for unrelated instances', async () => {
@@ -195,6 +241,12 @@ describe('projectsScopeFilter', () => {
     let project2Child1: InstanceElement
     let project2Child2: InstanceElement
 
+    let project2childRef11: InstanceElement
+    let project2childRef12: InstanceElement
+    let project2childRef21: InstanceElement
+    let project2childRef22: InstanceElement
+
+
     beforeEach(() => {
       // project1 <= project1Child1 <= project1Child2
       project1Child1 = new InstanceElement('project1Child11', generalType, {}, undefined, {
@@ -204,19 +256,31 @@ describe('projectsScopeFilter', () => {
         [CORE_ANNOTATIONS.PARENT]: [new ReferenceExpression(project1Child1.elemID, project1Child1)],
       })
 
+      project2childRef21 = new InstanceElement('project2childRef21', generalType, {})
+      project2childRef22 = new InstanceElement('project2childRef22', generalType, {})
+      project2childRef11 = new InstanceElement('project2childRef11', generalType, {
+        field: new ReferenceExpression(project2childRef21.elemID, project2childRef21),
+      })
+      project2childRef12 = new InstanceElement('project2childRef12', generalType, {
+        field: new ReferenceExpression(project2childRef22.elemID, project2childRef22),
+      })
       // project2 <= project2Child1 <= project2Child2
-      project2Child1 = new InstanceElement('project2Child11', generalType, {}, undefined, {
+      project2Child1 = new InstanceElement('project2Child11', generalType, {
+        field1: new ReferenceExpression(project2childRef11.elemID, project2childRef11),
+        field2: new ReferenceExpression(project2childRef12.elemID, project2childRef12),
+      }, undefined, {
         [CORE_ANNOTATIONS.PARENT]: [new ReferenceExpression(project2.elemID, project2)],
       })
       project2Child2 = new InstanceElement('project2Child12', generalType, {}, undefined, {
         [CORE_ANNOTATIONS.PARENT]: [new ReferenceExpression(project2Child1.elemID, project2Child1)],
       })
+
     })
 
     it('should add projectsScope recursively for project children', async () => {
-      elements = [project1, project1Child1, project1Child2, project2, project2Child1, project2Child2]
+      elements = [project1, project1Child1, project1Child2, project2, project2Child1, project2Child2, project2childRef11, project2childRef12, project2childRef21, project2childRef22]
       await filter.onFetch(elements)
-      expect(elements.length).toBe(6)
+      expect(elements.length).toBe(10)
 
       expect(project1.value.projectsScope).toEqual(['project1Key'])
       expect(project1Child1.value.projectsScope).toEqual(['project1Key'])
@@ -225,6 +289,11 @@ describe('projectsScopeFilter', () => {
       expect(project2.value.projectsScope).toEqual(['project2Key'])
       expect(project2Child1.value.projectsScope).toEqual(['project2Key'])
       expect(project2Child2.value.projectsScope).toEqual(['project2Key'])
+      // project2child references
+      expect(project2childRef11.value.projectsScope).toEqual(['project2Key'])
+      expect(project2childRef12.value.projectsScope).toEqual(['project2Key'])
+      expect(project2childRef21.value.projectsScope).toEqual(['project2Key'])
+      expect(project2childRef22.value.projectsScope).toEqual(['project2Key'])
     })
 
     it('should not add projectsScope for unrelated instances', async () => {

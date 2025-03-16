@@ -6,16 +6,22 @@
  * CERTAIN THIRD PARTY SOFTWARE MAY BE CONTAINED IN PORTIONS OF THE SOFTWARE. See NOTICE FILE AT https://github.com/salto-io/salto/blob/main/NOTICES
  */
 import {
+  BuiltinTypes,
+  CORE_ANNOTATIONS,
   Element,
   ElemID,
+  Field,
   InstanceElement,
   isInstanceElement,
   isReferenceExpression,
+  ListType,
+  ObjectType,
   ReferenceExpression,
 } from '@salto-io/adapter-api'
 import _ from 'lodash'
 import { collections } from '@salto-io/lowerdash'
 import {
+  getParent,
   getParentOrUndefined,
   isResolvedReferenceExpression,
   walkOnValue,
@@ -25,6 +31,7 @@ import { logger } from '@salto-io/logging'
 import { FilterCreator } from '../filter'
 import { AUTOMATION_TYPE, BOARD_TYPE_NAME, FIELD_TYPE, PROJECT_TYPE } from '../constants'
 import { FIELD_CONTEXT_TYPE_NAME } from './fields/constants'
+import { addOrUpdate } from '../utils'
 
 const log = logger(module)
 const { makeArray } = collections.array
@@ -37,10 +44,8 @@ type BoardWithProjectId = {
   }
 }
 
-const isBoardWithProjectId = (element: unknown): element is InstanceElement & { value: BoardWithProjectId } =>
-  isInstanceElement(element) &&
-  element.elemID.typeName === BOARD_TYPE_NAME &&
-  isReferenceExpression(element.value.location?.projectId)
+const isBoardWithProjectId = (element: InstanceElement): element is InstanceElement & { value: BoardWithProjectId } =>
+  element.elemID.typeName === BOARD_TYPE_NAME && isReferenceExpression(element.value.location?.projectId)
 
 type AutomationWithProjectId = {
   projects: {
@@ -48,8 +53,9 @@ type AutomationWithProjectId = {
   }[]
 }
 
-const isAutomationWithProjectId = (element: unknown): element is InstanceElement & { value: AutomationWithProjectId } =>
-  isInstanceElement(element) &&
+const isAutomationWithProjectId = (
+  element: InstanceElement,
+): element is InstanceElement & { value: AutomationWithProjectId } =>
   element.elemID.typeName === AUTOMATION_TYPE &&
   Array.isArray(element.value.projects) &&
   element.value.projects.some((projectInfo: { projectId: unknown }) => isReferenceExpression(projectInfo.projectId))
@@ -58,8 +64,9 @@ type ContextWithProjectIds = {
   projectIds: ReferenceExpression[]
 }
 
-const isContextWithProjectIds = (element: unknown): element is InstanceElement & { value: ContextWithProjectIds } =>
-  isInstanceElement(element) &&
+const isContextWithProjectIds = (
+  element: InstanceElement,
+): element is InstanceElement & { value: ContextWithProjectIds } =>
   element.elemID.typeName === FIELD_CONTEXT_TYPE_NAME &&
   Array.isArray(element.value.projectIds) &&
   element.value.projectIds.every(isReferenceExpression)
@@ -69,67 +76,21 @@ type ProjectScopeInfo = {
   projectKeys: Set<string>
 }
 
-const getProjectScope = (project: InstanceElement, projectChildren: InstanceElement[]): ElemID[] => {
-  // for each project we retrieve all the instances that this project tree contains
-  const instances = [project, ...projectChildren]
-  const instancesToWalkOn = instances
-  const instanceScope = Object.fromEntries(instances.map(instance => [instance.elemID.getFullName(), instance.elemID]))
-
-  const getInstanceReferences = (inst: InstanceElement): void => {
-    walkOnValue({
-      elemId: inst.elemID,
-      value: inst.value,
-      func: ({ value, path }) => {
-        if (isResolvedReferenceExpression(value)) {
-          if (path.typeName === FIELD_TYPE && value.elemID.typeName === FIELD_CONTEXT_TYPE_NAME) {
-            const contextValue = value.value.value
-            // we don't want to add other projects contexts to the project scope,
-            // therefore we skip all contexts that are not global.
-            // the project contexts are handled in the context section (addContextsToProjectScope)
-            if (makeArray(contextValue.projectIds).length > 0) {
-              return WALK_NEXT_STEP.SKIP
-            }
-          }
-          // prevent infinite loop
-          if (value.elemID.typeName === PROJECT_TYPE) {
-            return WALK_NEXT_STEP.SKIP
-          }
-          instanceScope[value.elemID.getFullName()] = value.elemID
-          instancesToWalkOn.push(value.value)
-          return WALK_NEXT_STEP.SKIP
-        }
-        return WALK_NEXT_STEP.RECURSE
-      },
-    })
-  }
-
-  while (instancesToWalkOn.length > 0) {
-    const currentInstance = instancesToWalkOn.pop()
-    if (currentInstance === undefined) {
-      break
-    }
-    getInstanceReferences(currentInstance)
-  }
-  return Object.values(instanceScope)
-}
-
-const getInstanceChildrenTree = (
+const getDescendants = (
   instance: InstanceElement,
   instanceFullNameToChildren: Record<string, InstanceElement[]>,
+  visitedDescendants: Set<string>,
 ): InstanceElement[] => {
   const instanceChildren = []
   const instancesToWalkOn = [instance]
-  const walkedInstancesFullName = new Set<string>()
+  const newVisitedDescendants = new Set<string>(visitedDescendants)
 
   while (instancesToWalkOn.length > 0) {
-    const currentInstance = instancesToWalkOn.pop()
-    if (currentInstance === undefined) {
-      break
-    }
-    walkedInstancesFullName.add(currentInstance.elemID.getFullName())
+    const currentInstance = instancesToWalkOn.pop()!
+    newVisitedDescendants.add(currentInstance.elemID.getFullName())
     const currentChildren = instanceFullNameToChildren[currentInstance.elemID.getFullName()]
     if (currentChildren !== undefined) {
-      const childrenToWalkOn = currentChildren.filter(child => !walkedInstancesFullName.has(child.elemID.getFullName()))
+      const childrenToWalkOn = currentChildren.filter(child => !newVisitedDescendants.has(child.elemID.getFullName()))
       instanceChildren.push(...childrenToWalkOn)
       instancesToWalkOn.push(...childrenToWalkOn)
     }
@@ -137,16 +98,86 @@ const getInstanceChildrenTree = (
   return instanceChildren
 }
 
+// This function is used to get all the instances that are referenced from a project (not including other projects)
+// This function changes the instancesToWalkOn and instanceScope arguments by reference
+const getProjectReferences = ({
+  instance,
+  instancesToWalkOn,
+  instanceScope,
+  fullNameToInstance,
+}: {
+  instance: InstanceElement
+  instancesToWalkOn: InstanceElement[]
+  instanceScope: Record<string, ElemID>
+  fullNameToInstance: Record<string, InstanceElement>
+}): void => {
+  walkOnValue({
+    elemId: instance.elemID,
+    value: instance.value,
+    func: ({ value, path }) => {
+      if (isResolvedReferenceExpression(value)) {
+        if (path.typeName === FIELD_TYPE && value.elemID.typeName === FIELD_CONTEXT_TYPE_NAME) {
+          const contextValue = value.value.value
+          // we don't want to add other projects contexts to the project scope,
+          // therefore we skip all contexts that are not global.
+          // the project contexts are handled in the context section (addContextsToProjectScope)
+          if (makeArray(contextValue.projectIds).length > 0) return WALK_NEXT_STEP.SKIP
+        }
+        // we don't want to add other projects to the project scope, in addition it might cause an infinite loop
+        if (value.elemID.typeName === PROJECT_TYPE) return WALK_NEXT_STEP.SKIP
+        if (instanceScope[value.elemID.getFullName()] === undefined) {
+          instanceScope[value.elemID.getFullName()] = value.elemID
+          // handle references to not top level elements
+          const instanceToWalkOn = isInstanceElement(value.value) ? value.value : fullNameToInstance[value.elemID.createTopLevelParentID().parent.getFullName()]
+          if (instanceToWalkOn === undefined) {
+            log.error(`Instance to walk on is undefined for ${value.elemID.getFullName()}. The projects scope is incomplete for instance ${instance.elemID.getFullName()}`)
+            return WALK_NEXT_STEP.SKIP
+          }
+          instancesToWalkOn.push(instanceToWalkOn)
+        }
+        return WALK_NEXT_STEP.SKIP
+      }
+      return WALK_NEXT_STEP.RECURSE
+    },
+  })
+}
+
+// for each project we retrieve all the instances that this project tree contains.
+// It is done by walking on the project and its children.
+// We gather all the instances that are referenced from the project and its children.
+const getProjectScope = (
+  instances: InstanceElement[],
+  instanceFullNameToChildren: Record<string, InstanceElement[]>,
+  fullNameToInstance: Record<string, InstanceElement>,
+): ElemID[] => {
+  // fullNameToElemId is the project scope
+  const fullNameToElemId = Object.fromEntries(instances.map(instance => [instance.elemID.getFullName(), instance.elemID]))
+  const visitedDescendants = new Set<string>()
+  while (instances.length > 0) {
+    const currentInstance = instances.pop()!
+
+    const descendants = getDescendants(currentInstance, instanceFullNameToChildren, visitedDescendants)
+    descendants.forEach(descendant => {
+      fullNameToElemId[descendant.elemID.getFullName()] = descendant.elemID
+      instances.push(descendant)
+      visitedDescendants.add(descendant.elemID.getFullName())
+    })
+    getProjectReferences({
+      instance: currentInstance,
+      instancesToWalkOn: instances,
+      instanceScope: fullNameToElemId,
+      fullNameToInstance,
+    })
+  }
+  return Object.values(fullNameToElemId)
+}
+
 const addBoardsToProjectScope = (
   instances: InstanceElement[],
   projectFullNameToScope: Record<string, InstanceElement[]>,
 ): void => {
   instances.filter(isBoardWithProjectId).forEach(board => {
-    const projectRef = board.value.location.projectId
-    if (projectFullNameToScope[projectRef.elemID.getFullName()] === undefined) {
-      projectFullNameToScope[projectRef.elemID.getFullName()] = []
-    }
-    projectFullNameToScope[projectRef.elemID.getFullName()].push(board)
+    addOrUpdate(projectFullNameToScope, board.value.location.projectId.elemID.getFullName(), board)
   })
 }
 
@@ -160,10 +191,7 @@ const addAutomationsToProjectScope = (
       if (!isReferenceExpression(projectRef)) {
         return
       }
-      if (projectFullNameToScope[projectRef.elemID.getFullName()] === undefined) {
-        projectFullNameToScope[projectRef.elemID.getFullName()] = []
-      }
-      projectFullNameToScope[projectRef.elemID.getFullName()].push(automation)
+      addOrUpdate(projectFullNameToScope, projectRef.elemID.getFullName(), automation)
     })
   })
 }
@@ -173,37 +201,33 @@ const addContextsToProjectScope = (
   projectFullNameToScope: Record<string, InstanceElement[]>,
 ): void => {
   instances.filter(isContextWithProjectIds).forEach(context => {
-    const { projectIds } = context.value
-    projectIds.forEach(projectId => {
-      if (projectFullNameToScope[projectId.elemID.getFullName()] === undefined) {
-        projectFullNameToScope[projectId.elemID.getFullName()] = []
-      }
-      projectFullNameToScope[projectId.elemID.getFullName()].push(context)
+    context.value.projectIds.forEach(projectId => {
+      addOrUpdate(projectFullNameToScope, projectId.elemID.getFullName(), context)
     })
   })
 }
 
 const getProjectFullNameToScope = (instances: InstanceElement[]): Record<string, InstanceElement[]> => {
   const projectFullNameToScope: Record<string, InstanceElement[]> = {}
-  addBoardsToProjectScope(instances, projectFullNameToScope)
-  addAutomationsToProjectScope(instances, projectFullNameToScope)
-  addContextsToProjectScope(instances, projectFullNameToScope)
+  const addInstancesToProjectScopeFuncs = [
+    addBoardsToProjectScope,
+    addAutomationsToProjectScope,
+    addContextsToProjectScope,
+  ]
+  addInstancesToProjectScopeFuncs.forEach(addInstancesToProjectScopeFunc => {
+    addInstancesToProjectScopeFunc(instances, projectFullNameToScope)
+  })
+  Object.entries(projectFullNameToScope).forEach(([projectFullName, scope]) => {
+    projectFullNameToScope[projectFullName] = _.unionBy(scope, instance => instance.elemID.getFullName())
+  })
   return projectFullNameToScope
 }
 
-const getInstanceFullNameToChildren = (instances: InstanceElement[]): Record<string, InstanceElement[]> => {
-  const instanceFullNameToChildren: Record<string, InstanceElement[]> = {}
-  instances.forEach(instance => {
-    const parent = getParentOrUndefined(instance)
-    if (parent !== undefined) {
-      if (instanceFullNameToChildren[parent.elemID.getFullName()] === undefined) {
-        instanceFullNameToChildren[parent.elemID.getFullName()] = []
-      }
-      instanceFullNameToChildren[parent.elemID.getFullName()].push(instance)
-    }
-  })
-  return instanceFullNameToChildren
-}
+const getInstanceFullNameToChildren = (instances: InstanceElement[]): Record<string, InstanceElement[]> =>
+  _.chain(instances)
+    .filter(instance => getParentOrUndefined(instance) !== undefined)
+    .groupBy(instance => getParent(instance).elemID.getFullName())
+    .value()
 
 const getProjectsScopeInfo = (
   instances: InstanceElement[],
@@ -218,17 +242,15 @@ const getProjectsScopeInfo = (
       },
     ]),
   )
+  const fullNameToInstance = Object.fromEntries(instances.map(instance => [instance.elemID.getFullName(), instance]))
   const instanceFullNameToChildren = getInstanceFullNameToChildren(instances)
 
   instances
     .filter(instance => instance.elemID.typeName === PROJECT_TYPE)
     .forEach(project => {
-      const projectChildren = getInstanceChildrenTree(project, instanceFullNameToChildren)
-      const instancesReferringToProject = _.unionBy(
-        projectFullNameToScope[project.elemID.getFullName()] ?? [],
-        instance => instance.elemID.getFullName(),
-      )
-      const scope = getProjectScope(project, projectChildren.concat(instancesReferringToProject))
+      const instancesReferringToProject = makeArray(projectFullNameToScope[project.elemID.getFullName()])
+      instancesReferringToProject.push(project)
+      const scope = getProjectScope(instancesReferringToProject, instanceFullNameToChildren, fullNameToInstance)
       scope.forEach(elemId => {
         const topLevelElemId = elemId.isTopLevel() ? elemId : elemId.createTopLevelParentID().parent
         const fullName = topLevelElemId.getFullName()
@@ -240,9 +262,24 @@ const getProjectsScopeInfo = (
   return Object.values(instanceNameToProjectScopeInfo)
 }
 
+const createProjectScopeField = (objectType: ObjectType): Field =>
+  new Field(objectType, PROJECT_SCOPE_FIELD_NAME, new ListType(BuiltinTypes.STRING), {
+    [CORE_ANNOTATIONS.HIDDEN_VALUE]: true,
+  })
+
+const addProjectScopeToObjectTypes = (instances: InstanceElement[]): void => {
+  const objectTypes = _.uniqBy(
+    instances.map(instance => instance.getTypeSync()),
+    objectType => objectType.elemID.getFullName(),
+  )
+
+  objectTypes.forEach(objectType => {
+    objectType.fields[PROJECT_SCOPE_FIELD_NAME] = createProjectScopeField(objectType)
+  })
+}
+
 /**
- * This filter adds a hidden and important value field projectsScope to every instance's object type.
- * The projectsScope field is a list of projects keys that the instance is in scope of.
+ * This filter adds a hidden field called projectsScope which is a list of projects keys that the instance is in scope of.
  * The scope is determined by:
  * - references from projects (recursively)
  * - project children (recursively)
@@ -255,6 +292,7 @@ const filter: FilterCreator = ({ config }) => ({
       return
     }
     const instances = elements.filter(isInstanceElement)
+    addProjectScopeToObjectTypes(instances)
 
     const projectFullNameToScope = getProjectFullNameToScope(instances)
     const projectsScopeInfo = getProjectsScopeInfo(instances, projectFullNameToScope)
