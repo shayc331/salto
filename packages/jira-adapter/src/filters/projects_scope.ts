@@ -128,9 +128,13 @@ const getProjectReferences = ({
         if (instanceScope[value.elemID.getFullName()] === undefined) {
           instanceScope[value.elemID.getFullName()] = value.elemID
           // handle references to not top level elements
-          const instanceToWalkOn = isInstanceElement(value.value) ? value.value : fullNameToInstance[value.elemID.createTopLevelParentID().parent.getFullName()]
+          const instanceToWalkOn = isInstanceElement(value.value)
+            ? value.value
+            : fullNameToInstance[value.elemID.createTopLevelParentID().parent.getFullName()]
           if (instanceToWalkOn === undefined) {
-            log.error(`Instance to walk on is undefined for ${value.elemID.getFullName()}. The projects scope is incomplete for instance ${instance.elemID.getFullName()}`)
+            log.error(
+              `Instance to walk on is undefined for ${value.elemID.getFullName()}. The projects scope is incomplete for instance ${instance.elemID.getFullName()}`,
+            )
             return WALK_NEXT_STEP.SKIP
           }
           instancesToWalkOn.push(instanceToWalkOn)
@@ -151,7 +155,9 @@ const getProjectScope = (
   fullNameToInstance: Record<string, InstanceElement>,
 ): ElemID[] => {
   // fullNameToElemId is the project scope
-  const fullNameToElemId = Object.fromEntries(instances.map(instance => [instance.elemID.getFullName(), instance.elemID]))
+  const fullNameToElemId = Object.fromEntries(
+    instances.map(instance => [instance.elemID.getFullName(), instance.elemID]),
+  )
   const visitedDescendants = new Set<string>()
   while (instances.length > 0) {
     const currentInstance = instances.pop()!
@@ -218,7 +224,7 @@ const getProjectFullNameToScope = (instances: InstanceElement[]): Record<string,
     addInstancesToProjectScopeFunc(instances, projectFullNameToScope)
   })
   Object.entries(projectFullNameToScope).forEach(([projectFullName, scope]) => {
-    projectFullNameToScope[projectFullName] = _.unionBy(scope, instance => instance.elemID.getFullName())
+    projectFullNameToScope[projectFullName] = _.uniqBy(scope, instance => instance.elemID.getFullName())
   })
   return projectFullNameToScope
 }
@@ -252,7 +258,7 @@ const getProjectsScopeInfo = (
       instancesReferringToProject.push(project)
       const scope = getProjectScope(instancesReferringToProject, instanceFullNameToChildren, fullNameToInstance)
       scope.forEach(elemId => {
-        const topLevelElemId = elemId.isTopLevel() ? elemId : elemId.createTopLevelParentID().parent
+        const topLevelElemId = elemId.createTopLevelParentID().parent
         const fullName = topLevelElemId.getFullName()
         if (instanceNameToProjectScopeInfo[fullName]?.projectKeys !== undefined) {
           instanceNameToProjectScopeInfo[fullName].projectKeys.add(project.value.key)
